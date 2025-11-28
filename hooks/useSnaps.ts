@@ -1,152 +1,200 @@
-import HiveClient from '@/lib/hive/hiveclient';
 import { useState, useEffect, useRef } from 'react';
 import { ExtendedComment } from './useComments';
-import { getFollowing } from '@/lib/hive/client-functions';
+import HiveClient from '@/lib/hive/hiveclient';
 
+// Tipo para paginação da Bridge API (Apenas para o filtro 'all')
 interface lastContainerInfo {
   permlink: string;
+  author: string;
   date: string;
 }
-
-type LastId = number | null; // Usar o ID retornado pela API
-const lastIdRef = useRef<LastId>(null);
 
 export type SnapFilterType = 'community' | 'all' | 'following';
 
 interface UseSnapsProps {
   filterType?: SnapFilterType;
-  username?: string; // Required when filterType is 'following'
+  username?: string; // Necessário quando filterType é 'following'
 }
 
 export const useSnaps = ({ filterType = 'community', username }: UseSnapsProps = {}) => {
-  const lastContainerRef = useRef<lastContainerInfo | null>(null); // Use useRef for last container
-  const fetchedPermlinksRef = useRef<Set<string>>(new Set()); // Track fetched permlinks
-  const followingListRef = useRef<string[]>([]); // Cache following list
+  // Cursor para Bridge API (filtro 'all')
+  const lastContainerRef = useRef<lastContainerInfo | null>(null);
+  
+  // Cursor para PeakD API (filtros 'following' e 'community') - ID numérico
+  const lastIdRef = useRef<number | null>(null);
+  
+  const fetchedPermlinksRef = useRef<Set<string>>(new Set()); 
 
   const [currentPage, setCurrentPage] = useState(1);
   const [comments, setComments] = useState<ExtendedComment[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [hasMore, setHasMore] = useState(true);
-  const [followingListLoaded, setFollowingListLoaded] = useState(false);
   const [fetchTrigger, setFetchTrigger] = useState(0);
 
   const pageMinSize = 10;
   
-  // Load following list once when needed
-  useEffect(() => {
-    const loadFollowingList = async () => {
-      if (filterType === 'following' && username) {
-        if (followingListRef.current.length === 0) {
-          setFollowingListLoaded(false);
-          try {
-            const following = await getFollowing(username, '', 1000);
-            followingListRef.current = following;
-            setFollowingListLoaded(true);
-            setFetchTrigger(prev => prev + 1); // Trigger fetch once list is loaded
-          } catch (error) {
-            console.error('Error loading following list:', error);
-            setFollowingListLoaded(true); // Set to true even on error to prevent infinite loading
-            setFetchTrigger(prev => prev + 1); // Trigger fetch anyway
-          }
-        } else {
-          setFollowingListLoaded(true);
-          setFetchTrigger(prev => prev + 1); // Trigger fetch since list already loaded
-        }
-      }
+  // Helper para chamar nosso Proxy interno e evitar CORS
+  const fetchFromProxy = async (endpointType: 'feed' | 'tags', params: Record<string, string | number>) => {
+    // Constrói a query string para o nosso proxy
+    const query = new URLSearchParams({
+        type: endpointType,
+        ...params as any
+    }).toString();
+
+    // Chama a API local (/pages/api/peakd-proxy.ts)
+    const response = await fetch(`/api/peakd-proxy?${query}`);
+    
+    if (!response.ok) {
+        throw new Error(`Failed to fetch from Proxy (${endpointType})`);
+    }
+    
+    return await response.json();
+  }
+
+  // Lógica 1: Buscar feed de seguidores via Proxy
+  async function fetchFollowingFeed(): Promise<ExtendedComment[]> {
+    if (!username) return [];
+
+    const params: any = {
+        container: 'peak.snaps',
+        username: username,
+        limit: pageMinSize
     };
-    loadFollowingList();
-  }, [filterType, username]);
+    
+    if (lastIdRef.current) {
+        params.startId = lastIdRef.current;
+    }
 
-  // Filter comments by the target tag
-  function filterCommentsByTag(comments: ExtendedComment[], targetTag: string): ExtendedComment[] {
-    return comments.filter((commentItem) => {
-      try {
-        if (!commentItem.json_metadata) {
-          return false; // Skip if json_metadata is empty
-        }
-        const metadata = JSON.parse(commentItem.json_metadata);
-        const tags = metadata.tags || [];
-        return tags.includes(targetTag);
-      } catch (error) {
-        console.error('Error parsing JSON metadata for comment:', commentItem, error);
-        return false; // Exclude comments with invalid JSON
-      }
-    });
+    // Usa o endpoint 'feed' via proxy
+    const newSnaps: ExtendedComment[] = (await fetchFromProxy('feed', params)) as ExtendedComment[];
+
+    if (newSnaps.length > 0) {
+      lastIdRef.current = newSnaps[newSnaps.length - 1].id; 
+    }
+
+    return newSnaps;
   }
 
-  // Filter comments by following
-  function filterCommentsByFollowing(comments: ExtendedComment[]): ExtendedComment[] {
-    return comments.filter((commentItem) => 
-      followingListRef.current.includes(commentItem.author)
+  // Lógica 2: Buscar feed da COMUNIDADE via Proxy
+  async function fetchCommunityFeed(): Promise<ExtendedComment[]> {
+    const tag = "hive-197333"; //|| process.env.NEXT_PUBLIC_HIVE_COMMUNITY_TAG;
+    if (!tag) {
+        console.warn("Community tag not defined");
+        return [];
+    }
+
+    const params: any = {
+        container: 'peak.snaps',
+        tag: tag,
+        limit: pageMinSize
+    };
+
+    if (lastIdRef.current) {
+        params.startId = lastIdRef.current;
+    }
+
+    // Usa o endpoint 'tags' via proxy
+    const newSnaps: ExtendedComment[] = (await fetchFromProxy('tags', params)) as ExtendedComment[];
+
+    if (newSnaps.length > 0) {
+      lastIdRef.current = newSnaps[newSnaps.length - 1].id; 
+    }
+
+    return newSnaps;
+  }
+
+  // Lógica 3: Buscar TUDO via Hive Bridge (Server-side call do HiveClient já evita CORS se configurado, ou é direto no blockchain que permite CORS)
+  // Hive nodes geralmente permitem CORS, então mantemos direto.
+  async function fetchHiveBridgeFeed(): Promise<ExtendedComment[]> {
+    const containerAuthor = "peak.snaps";
+    const limit = 2; 
+
+    let startAuthor = lastContainerRef.current?.author || null;
+    let startPermlink = lastContainerRef.current?.permlink || null;
+
+    // 1. Busca os posts Contêineres
+    const containerPosts = (await HiveClient.call('bridge','get_account_posts', [{
+        account: containerAuthor,
+        limit: limit,
+        sort: "posts",
+        start_author: startAuthor,
+        start_permlink: startPermlink,
+    }])) as any[];
+
+    if (!containerPosts || containerPosts.length === 0) {
+        return [];
+    }
+
+    // 2. Busca as respostas (Snaps) em paralelo
+    const repliesPromises = containerPosts.map((container) => 
+        HiveClient.database.call("get_content_replies", [
+          container.author,
+          container.permlink,
+        ]).then((comments: any) => ({
+             comments: comments as ExtendedComment[],
+             parentPermlink: container.permlink,
+             parentAuthor: container.author
+        }))
     );
+
+    const repliesResults = await Promise.all(repliesPromises);
+    const allFilteredComments: ExtendedComment[] = [];
+
+    // 3. Processa
+    let lastProcessedItem: any | null = null;
+
+    for (const { comments, parentPermlink, parentAuthor } of repliesResults) {
+        allFilteredComments.push(...comments);
+        fetchedPermlinksRef.current.add(parentPermlink);
+        
+        lastProcessedItem = { author: parentAuthor, permlink: parentPermlink };
+    }
+
+    // Atualiza o cursor
+    if (lastProcessedItem) {
+        lastContainerRef.current = { 
+            author: lastProcessedItem.author, 
+            permlink: lastProcessedItem.permlink, 
+            date: new Date().toISOString() 
+        };
+    }
+
+    return allFilteredComments;
   }
 
-  // Fetch comments with a minimum size
-async function getMoreSnaps(): Promise<ExtendedComment[]> {
-  const container = 'peak.snaps';
-  const limit = pageMinSize; // Use pageMinSize diretamente.
-  
-  let url = `https://peakd.com/api/public/snaps/feed?container=${container}&limit=${limit}`;
-
-  // Se o filtro for 'following' e o username estiver disponível, passe o username.
-  // IMPORTANTE: Assumimos que a PeakD API lida com o filtro 'following'
-  if (filterType === 'following' && username) {
-      url += `&username=${username}`; 
-  }
-  
-  // Adiciona o cursor se não for a primeira página
-  if (lastIdRef.current) {
-    url += `&startId=${lastIdRef.current}`;
+  // Função principal
+  async function getMoreSnaps(): Promise<ExtendedComment[]> {
+      if (filterType === 'following') {
+          return await fetchFollowingFeed();
+      } else if (filterType === 'community') {
+          return await fetchCommunityFeed();
+      } else {
+          return await fetchHiveBridgeFeed();
+      }
   }
 
-  const response = await fetch(url);
-  
-  if (!response.ok) {
-    throw new Error('Failed to fetch snaps from PeakD API');
-  }
-
-  // OTIMIZAÇÃO: A API PeakD retorna um array de objetos simplificados.
-  // Você precisará mapear o retorno para o tipo 'ExtendedComment' se o seu componente
-  // consumir esse formato. Se o formato for compatível, basta retornar o JSON.
-  const newSnaps: ExtendedComment[] = (await response.json()) as ExtendedComment[];
-
-  if (newSnaps.length > 0) {
-    // Atualiza o cursor para o ID do último item retornado
-    lastIdRef.current = newSnaps[newSnaps.length - 1].id; 
-  }
-
-  return newSnaps;
-}
-
-  // Reset when filter changes
+  // Reset quando filtro muda
   useEffect(() => {
     lastContainerRef.current = null;
+    lastIdRef.current = null;
     fetchedPermlinksRef.current.clear();
     setComments([]);
     setHasMore(true);
     setCurrentPage(1);
-    setFetchTrigger(prev => prev + 1); // Trigger a new fetch
+    setFetchTrigger(prev => prev + 1);
   }, [filterType, username]);
 
-  // Fetch posts when `currentPage` changes (or when followingListLoaded changes for following filter)
+  // Busca posts quando currentPage muda
   useEffect(() => {
-    // Only wait for following list if we're on the following filter
-    if (filterType === 'following') {
-      if (!followingListLoaded) {
-        return; // Wait for following list to load
-      }
-    }
-
     const fetchPosts = async () => {
       setIsLoading(true);
       try {
         const newSnaps = await getMoreSnaps();
 
-        if (newSnaps.length < pageMinSize) {
-          setHasMore(false); // No more items to fetch
-        }
+        if (newSnaps.length === 0 && (filterType === 'following' || filterType === 'community')) {
+             setHasMore(false); 
+        } 
 
-        // Avoid duplicates in the comments array
         setComments((prevPosts) => {
           const existingPermlinks = new Set(prevPosts.map((post) => post.permlink));
           const uniqueSnaps = newSnaps.filter((snap) => !existingPermlinks.has(snap.permlink));
@@ -163,14 +211,13 @@ async function getMoreSnaps(): Promise<ExtendedComment[]> {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentPage, fetchTrigger]);
 
-  // Load the next page with throttling
+  // Load next page com throttling
   const loadNextPage = (() => {
     let isThrottled = false;
     return () => {
       if (!isLoading && hasMore && !isThrottled) {
         isThrottled = true;
         setCurrentPage((prevPage) => prevPage + 1);
-        // Throttle for 1 second
         setTimeout(() => {
           isThrottled = false;
         }, 1000);
