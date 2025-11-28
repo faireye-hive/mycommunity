@@ -8,6 +8,9 @@ interface lastContainerInfo {
   date: string;
 }
 
+type LastId = number | null; // Usar o ID retornado pela API
+const lastIdRef = useRef<LastId>(null);
+
 export type SnapFilterType = 'community' | 'all' | 'following';
 
 interface UseSnapsProps {
@@ -79,63 +82,41 @@ export const useSnaps = ({ filterType = 'community', username }: UseSnapsProps =
   }
 
   // Fetch comments with a minimum size
-  async function getMoreSnaps(): Promise<ExtendedComment[]> {
-    const tag = process.env.NEXT_PUBLIC_HIVE_COMMUNITY_TAG || ''
-    const author = "peak.snaps";
-    const limit = 3;
-    const allFilteredComments: ExtendedComment[] = [];
+async function getMoreSnaps(): Promise<ExtendedComment[]> {
+  const container = 'peak.snaps';
+  const limit = pageMinSize; // Use pageMinSize diretamente.
+  
+  let url = `https://peakd.com/api/public/snaps/feed?container=${container}&limit=${limit}`;
 
-    let hasMoreData = true; // To track if there are more containers to fetch
-    let permlink = lastContainerRef.current?.permlink || "";
-    let date = lastContainerRef.current?.date || new Date().toISOString();
-
-    while (allFilteredComments.length < pageMinSize && hasMoreData) {
-
-      const result = await HiveClient.database.call('get_discussions_by_author_before_date', [
-        author,
-        permlink,
-        date,
-        limit,
-      ]);
-
-      if (!result.length) {
-        hasMoreData = false;
-        break;
-      }
-
-      for (const resultItem of result) {
-        const comments = (await HiveClient.database.call("get_content_replies", [
-          author,
-          resultItem.permlink,
-        ])) as ExtendedComment[];
-
-        let filteredComments: ExtendedComment[] = [];
-        
-        // Apply appropriate filter based on filterType
-        if (filterType === 'community') {
-          filteredComments = filterCommentsByTag(comments, tag);
-        } else if (filterType === 'all') {
-          filteredComments = comments;
-        } else if (filterType === 'following') {
-          filteredComments = filterCommentsByFollowing(comments);
-        }
-
-        allFilteredComments.push(...filteredComments);
-
-        // Add permlink to the fetched set
-        fetchedPermlinksRef.current.add(resultItem.permlink);
-
-        // Update the last container info for the next fetch
-        permlink = resultItem.permlink;
-        date = resultItem.created;
-      }
-    }
-
-    // Update the lastContainerRef state for the next API call
-    lastContainerRef.current = { permlink, date };
-
-    return allFilteredComments;
+  // Se o filtro for 'following' e o username estiver disponível, passe o username.
+  // IMPORTANTE: Assumimos que a PeakD API lida com o filtro 'following'
+  if (filterType === 'following' && username) {
+      url += `&username=${username}`; 
   }
+  
+  // Adiciona o cursor se não for a primeira página
+  if (lastIdRef.current) {
+    url += `&startId=${lastIdRef.current}`;
+  }
+
+  const response = await fetch(url);
+  
+  if (!response.ok) {
+    throw new Error('Failed to fetch snaps from PeakD API');
+  }
+
+  // OTIMIZAÇÃO: A API PeakD retorna um array de objetos simplificados.
+  // Você precisará mapear o retorno para o tipo 'ExtendedComment' se o seu componente
+  // consumir esse formato. Se o formato for compatível, basta retornar o JSON.
+  const newSnaps: ExtendedComment[] = (await response.json()) as ExtendedComment[];
+
+  if (newSnaps.length > 0) {
+    // Atualiza o cursor para o ID do último item retornado
+    lastIdRef.current = newSnaps[newSnaps.length - 1].id; 
+  }
+
+  return newSnaps;
+}
 
   // Reset when filter changes
   useEffect(() => {
